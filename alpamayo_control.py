@@ -34,7 +34,16 @@ STEER_SIGN = -1.0          # 좌(+y) -> CARLA steer 음수
 DEFAULT_WHEELBASE_M = 2.875  # Tesla Model 3
 DEFAULT_MAX_STEER_DEG = 70.0
 
-# pure pursuit lookahead = clamp(k_v * speed + L0, MIN, MAX)
+# pure pursuit lookahead 방식 선택
+#   True  : i_now 이후 남은 경로 인덱스의 일정 퍼센트 지점을 목표점으로 사용
+#   False : arc length 기반 lookahead 거리(ld)로 목표점 선택
+USE_INDEX_LOOKAHEAD = True
+# 전체 경로(0..n-1) 중 이 비율 지점의 인덱스를 목표로. 0~1.
+LOOKAHEAD_INDEX_PCT = 0.5
+# pure pursuit 특성상 목표점은 현재(i_now)보다 앞서야 하므로 최소 앞선 점 수.
+LOOKAHEAD_INDEX_MIN_STEP = 2
+
+# arc length 기반 lookahead = clamp(k_v * speed + L0, MIN, MAX)
 LOOKAHEAD_K = 0.6
 LOOKAHEAD_L0 = 4.0
 LOOKAHEAD_MIN = 4.0
@@ -44,7 +53,12 @@ LOOKAHEAD_MAX = 20.0
 KP_THROTTLE = 0.5
 KP_BRAKE = 0.5
 SPEED_DEADBAND_MPS = 0.3
-TARGET_SPEED_LEAD = 3       # 목표속도를 현재 진행점 기준 몇 점 앞에서 읽을지
+
+# 종방향: 모델 속도(pred_v_mps) 대신 고정 목표속도 사용.
+#   - 횡방향(조향)만 Alpamayo 경로로 제어
+#   - 항상 움직이므로 ego-history 정지 트랩 회피
+USE_FIXED_TARGET_SPEED = True
+TARGET_SPEED_KMH = 10.0
 
 # plan 은 t0 기준 6.4초(64점) full plan 이므로, 추론 공백 동안에도 직전 plan 을
 # "경과시간만큼 진행시켜" 계속 따라간다. STALE 은 그래도 너무 오래된 plan 차단용.
@@ -177,17 +191,23 @@ class PathFollower:
         cyaw = self._heading_at(points, yaws, i_now)  # 현재 진행 방향
         cos_y, sin_y = math.cos(cyaw), math.sin(cyaw)
 
-        # i_now 부터 호길이(arc length)로 lookahead 거리 이상인 점을 목표로
-        ld = min(LOOKAHEAD_MAX, max(LOOKAHEAD_MIN,
-                                    LOOKAHEAD_K * speed_mps + LOOKAHEAD_L0))
-        acc = 0.0
-        ti = n - 1
-        for i in range(i_now, n - 1):
-            acc += math.hypot(points[i + 1][0] - points[i][0],
-                              points[i + 1][1] - points[i][1])
-            if acc >= ld:
-                ti = i + 1
-                break
+        if USE_INDEX_LOOKAHEAD:
+            # 전체 경로(0..n-1) 인덱스의 LOOKAHEAD_INDEX_PCT 지점을 목표로.
+            # 단, pure pursuit 은 목표가 현재보다 앞서야 하므로 i_now 기준 하한을 둔다.
+            ti = int(round(LOOKAHEAD_INDEX_PCT * (n - 1)))
+            ti = max(ti, min(n - 1, i_now + LOOKAHEAD_INDEX_MIN_STEP))
+        else:
+            # i_now 부터 호길이(arc length)로 lookahead 거리 이상인 점을 목표로
+            ld = min(LOOKAHEAD_MAX, max(LOOKAHEAD_MIN,
+                                        LOOKAHEAD_K * speed_mps + LOOKAHEAD_L0))
+            acc = 0.0
+            ti = n - 1
+            for i in range(i_now, n - 1):
+                acc += math.hypot(points[i + 1][0] - points[i][0],
+                                  points[i + 1][1] - points[i][1])
+                if acc >= ld:
+                    ti = i + 1
+                    break
         tx, ty = points[ti]
 
         # 목표점을 '현재 차 프레임'으로 변환 (현재 위치 기준 평행이동 + -cyaw 회전)
@@ -205,13 +225,12 @@ class PathFollower:
             steer_cmd = STEER_SIGN * delta / self.max_steer_rad
             steer_cmd = max(-1.0, min(1.0, steer_cmd))
 
-        # 종방향: 현재 진행점 기준 살짝 앞 지점의 목표속도 P 제어
-        v_list = plan.get("v_mps") or []
-        if v_list:
-            idx = min(i_now + TARGET_SPEED_LEAD, len(v_list) - 1)
-            v_target = float(v_list[idx])
+        # 종방향: 고정 목표속도(기본 10km/h) P 제어. (모델 속도는 무시)
+        if USE_FIXED_TARGET_SPEED:
+            v_target = TARGET_SPEED_KMH / 3.6
         else:
-            v_target = speed_mps
+            v_list = plan.get("v_mps") or []
+            v_target = float(v_list[min(i_now, len(v_list) - 1)]) if v_list else speed_mps
         err = v_target - speed_mps
         throttle = brake = 0.0
         if err > SPEED_DEADBAND_MPS:
