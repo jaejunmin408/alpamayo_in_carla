@@ -432,10 +432,10 @@ def main():
                         e2e_ms = (now * 1e6 - t0_us) / 1000.0 if t0_us else float("nan")
                         infer_ms = (plan.get("inference_time_s") or 0.0) * 1000.0
                         gap_ms = (now - last_plan_log_t) * 1000.0 if last_plan_log_t else 0.0
-                        i_now = follower._now_index(plan, age)
                         print(f"[{ts}] plan seq={seq} e2e={e2e_ms:6.0f}ms "
                               f"infer={infer_ms:5.0f}ms gap={gap_ms:6.0f}ms "
-                              f"i_now={i_now:2d} steer={st:+.2f} thr={th:.2f} "
+                              f"s={follower.last_slice_s:4.1f}m gi={follower.last_i_goal:2d} "
+                              f"steer={st:+.2f} thr={th:.2f} "
                               f"brk={br:.2f} v={speed_mps * 3.6:4.1f}km/h",
                               flush=True)
                         last_logged_seq = seq
