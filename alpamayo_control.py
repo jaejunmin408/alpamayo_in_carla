@@ -17,7 +17,7 @@ UDP text_json 패킷 주요 필드 (planner_live/result_bridge.build_text_result
 
 제어:
   lateral      : world-frame closed-loop pure pursuit (실제 후륜축 pose 기준)
-  longitudinal : 고정 목표속도 P 제어 (throttle/brake)
+  longitudinal : 모델 속도(pred_v_mps) 목표 P 제어 (없으면 고정속도 fallback)
 """
 from __future__ import annotations
 
@@ -138,7 +138,9 @@ class WorldPathFollower:
 
     부호규약: follow_waypoints 와 동일. local_y = +y_world 성분(=CARLA 우측),
     α>0 -> δ>0 -> steer>0 = CARLA 우회전.
-    종방향: 고정 목표속도(TARGET_SPEED_KMH) P 제어.
+    종방향: 모델 속도(pred_v_mps) 목표 P 제어. set_path 에 velocities 를 주면
+    현재 위치의 점별 목표속도를 추종하고, 없으면 고정 목표속도(TARGET_SPEED_KMH).
+    use_model_speed=False 로 강제 고정속도 전환 가능(키 V).
     """
 
     def __init__(self, wheelbase_m=DEFAULT_WHEELBASE_M,
@@ -152,11 +154,15 @@ class WorldPathFollower:
         self.ld_max = ld_max
         self.reach_r = reach_r
         self._path: list[tuple[float, float]] = []   # world 좌표
+        self._vel: list[float] | None = None         # 점별 목표속도(m/s), 경로와 1:1
         self._idx = 0                                # 앞으로만 진행하는 최근접 인덱스
+        self.use_model_speed = True  # True 면 모델 pred_v_mps 를 종방향 목표로 사용
         # HUD/로깅
         self.last_i_goal = 0
         self.last_cte = 0.0        # 경로까지 최단거리(cross-track 크기)
         self.last_ld = 0.0
+        self.last_v_target = 0.0   # 최근 종방향 목표속도(m/s)
+        self.last_v_source = "fixed"  # "model" | "fixed"
         self.finished = False
 
     @property
@@ -167,10 +173,22 @@ class WorldPathFollower:
     def n_points(self) -> int:
         return len(self._path)
 
-    def set_path(self, world_points) -> None:
-        """추종할 경로를 CARLA world 좌표 [(x,y)..] 로 설정(새 경로마다 호출)."""
-        self._path = [(float(p[0]), float(p[1])) for p in world_points
-                      if len(p) >= 2]
+    def set_path(self, world_points, velocities=None) -> None:
+        """추종할 경로를 CARLA world 좌표 [(x,y)..] 로 설정(새 경로마다 호출).
+
+        velocities 를 주면(경로 점과 1:1 정렬된 목표속도 m/s) 종방향 제어에
+        모델 속도를 쓴다. 없으면(map route 등) 고정 목표속도로 fallback.
+        """
+        vel = list(velocities) if velocities is not None else None
+        path, vout = [], []
+        for i, p in enumerate(world_points):
+            if len(p) < 2:
+                continue
+            path.append((float(p[0]), float(p[1])))
+            if vel is not None and i < len(vel):
+                vout.append(float(vel[i]))
+        self._path = path
+        self._vel = vout if (vel is not None and len(vout) == len(path) and path) else None
         self._idx = 0
         self.finished = False
 
@@ -226,8 +244,15 @@ class WorldPathFollower:
             delta = math.atan2(2.0 * self.wheelbase * math.sin(alpha), dist)
             steer_cmd = max(-1.0, min(1.0, delta / self.max_steer_rad))
 
-        # 종방향: 고정 목표속도 P 제어
-        v_target = TARGET_SPEED_KMH / 3.6
+        # 종방향: 모델 속도(pred_v_mps)를 목표로 P 제어. 현재 위치(최근접점 ci)의
+        # 점별 목표속도를 사용한다. 속도가 없으면(map route 등) 고정 목표속도.
+        if self.use_model_speed and self._vel is not None:
+            v_target = self._vel[min(ci, len(self._vel) - 1)]
+            self.last_v_source = "model"
+        else:
+            v_target = TARGET_SPEED_KMH / 3.6
+            self.last_v_source = "fixed"
+        self.last_v_target = v_target
         err = v_target - speed_mps
         throttle = brake = 0.0
         if err > SPEED_DEADBAND_MPS:

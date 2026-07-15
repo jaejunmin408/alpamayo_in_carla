@@ -419,7 +419,8 @@ def main():
                 control_rx.start()
                 print(f"[alpamayo] 제어 준비 (closed-loop pure pursuit, "
                       f"wheelbase={wheelbase_m:.2f}m, max_steer={max_steer_deg:.1f}deg). "
-                      f"키 O 로 Alpamayo 주행 토글, 키 T 로 경로 앵커(현재/t0) 토글")
+                      f"키 O 로 Alpamayo 주행 토글, 키 T 로 경로 앵커(현재/t0) 토글, "
+                      f"키 V 로 종방향 목표속도(모델/고정) 토글")
             if args.map_route:
                 print(f"[map-route] 맵 차선 추종 준비 (dist={args.map_route_dist:.0f}m, "
                       f"step={args.map_route_step:.1f}m). 키 G 로 주행 토글")
@@ -544,6 +545,10 @@ def main():
                         anchor_t0 = not anchor_t0
                         print(f"[anchor] 경로 앵커 = "
                               f"{'t0 pose(추론 입력 시점)' if anchor_t0 else '현재 pose'}")
+                    elif event.key == pygame.K_v and follower is not None:
+                        follower.use_model_speed = not follower.use_model_speed
+                        print(f"[속도] 종방향 목표 = "
+                              f"{'모델 pred_v_mps' if follower.use_model_speed else '고정 목표속도'}")
                     elif event.key == pygame.K_g and follower is not None \
                             and args.map_route:
                         map_route_drive = not map_route_drive
@@ -619,7 +624,7 @@ def main():
                                                  wheelbase_m, newplan["points"])
                         if anchor_t0:
                             anchor_src = "현재(t0 조회실패)"
-                    follower.set_path(wpts)
+                    follower.set_path(wpts, newplan.get("v_mps"))
                     if viz is not None:
                         viz.set_fixed_path(wpts)
                     seq = newplan.get("seq")
@@ -650,6 +655,7 @@ def main():
                         control.steer, control.throttle, control.brake = st, th, br
                         alpa_hud = (f"PP steer={st:+.2f} thr={th:.2f} brk={br:.2f} "
                                     f"cte={follower.last_cte:.2f}m ld={follower.last_ld:.1f}m "
+                                    f"v*={follower.last_v_target * 3.6:.0f}kph({follower.last_v_source}) "
                                     f"gi={follower.last_i_goal}/{follower.n_points}")
                 vehicle.apply_control(control)
             # --- 수동운전: 눌린 키로 차량 제어 ---
