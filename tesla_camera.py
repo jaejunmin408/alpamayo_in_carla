@@ -41,7 +41,8 @@ import pygame
 from pygame._sdl2.video import Window, Renderer, Texture
 
 from alpamayo_bridge import AlpamayoBridge, REQUIRED_CAMERAS, IMAGE_W, IMAGE_H
-from alpamayo_control import AlpamayoControlReceiver, PathFollower, STALE_PLAN_S
+from alpamayo_control import AlpamayoControlReceiver, WorldPathFollower
+from viz_server import VizServer
 
 
 SIDE_LOCATIONS = {
@@ -102,6 +103,22 @@ def parse_args():
                    help="제어 UDP 수신 bind 주소")
     p.add_argument("--alpamayo-control-port", type=int, default=5005,
                    help="제어 UDP 수신 포트 (Thor --udp-port 와 일치)")
+    # --- 맵 ground-truth 경로 추종 (Alpamayo 없이 도로망 route 따라감) ---
+    p.add_argument("--map-route", action="store_true",
+                   help="맵 차선을 따라 앞으로 route를 뽑아 추종(키 G로 토글). "
+                        "제어기는 Alpamayo와 동일한 WorldPathFollower 재사용")
+    p.add_argument("--map-route-dist", type=float, default=200.0,
+                   help="맵 route 생성 거리(m, 현재 차선 따라 앞으로)")
+    p.add_argument("--map-route-step", type=float, default=2.0,
+                   help="맵 route waypoint 간격(m)")
+    # --- 디버그용 2D 맵 viz (스폰 위치를 0,0 으로 그린다) ---
+    p.add_argument("--viz", action="store_true",
+                   help="차량 위치 2D 맵 viz HTTP 서버를 띄운다 "
+                        "(브라우저에서 http://localhost:<viz-port>/ )")
+    p.add_argument("--viz-host", default="0.0.0.0",
+                   help="viz 서버 bind 주소 (기본 0.0.0.0)")
+    p.add_argument("--viz-port", type=int, default=8091,
+                   help="viz 서버 포트 (기본 8091)")
     return p.parse_args()
 
 
@@ -109,6 +126,75 @@ def grid_shape(n):
     cols = math.ceil(math.sqrt(n))
     rows = math.ceil(n / cols)
     return cols, rows
+
+
+def rear_axle_xy(transform, wheelbase):
+    """차량 transform(월드)에서 후륜축 위치(x, y[m])와 yaw(deg)를 계산.
+
+    후륜축 = 차량중심 - (L/2)*전방벡터. pure pursuit 제어(follow_waypoints,
+    alpamayo_control)가 쓰는 기준점과 동일하게 맞춰 viz 도 후륜축을 그린다.
+    """
+    yaw_deg = transform.rotation.yaw
+    yaw = math.radians(yaw_deg)
+    half = wheelbase / 2.0
+    x = transform.location.x - half * math.cos(yaw)
+    y = transform.location.y - half * math.sin(yaw)
+    return x, y, yaw_deg
+
+
+def ego_path_to_world(transform, wheelbase, points):
+    """ego-local 경로(x전방, y좌측+)를 CARLA world 좌표로 변환.
+
+    앵커 = 후륜축(viz 차 마커와 동일 기준점), 회전 = 차 yaw.
+      wx = rax + fx*cosφ + fy*sinφ
+      wy = ray + fx*sinφ - fy*cosφ
+    (ego +y=좌측이 φ=0 에서 world -y 로 가는 CARLA 좌수 좌표계 규약)
+    """
+    rax, ray, yaw_deg = rear_axle_xy(transform, wheelbase)
+    phi = math.radians(yaw_deg)
+    c, s = math.cos(phi), math.sin(phi)
+    out = []
+    for p in points:
+        fx, fy = float(p[0]), float(p[1])
+        out.append((rax + fx * c + fy * s, ray + fx * s - fy * c))
+    return out
+
+
+def lane_route_ahead(carla_map, transform, dist_m=200.0, step_m=2.0):
+    """현재 위치의 차선을 따라 앞으로 dist_m 만큼 waypoint world 경로를 생성.
+
+    map.get_waypoint 로 현재 pose를 도로(주행 차선)에 스냅한 뒤 wp.next(step)로
+    차선을 따라 전진한다. WorldPathFollower.set_path 에 바로 넣을 수 있는
+    [(x, y)..] world 좌표 리스트를 반환. (목적지 없이 도로 따라 주행)
+
+    교차로 등에서 wp.next 가 여러 갈래를 주면 진행방향(차 yaw)에 가장 가까운
+    분기를 골라 '직진 경향'으로 이어붙인다. (분기 없으면 그대로 진행)
+    """
+    wp = carla_map.get_waypoint(transform.location, project_to_road=True,
+                                lane_type=carla.LaneType.Driving)
+    if wp is None:
+        return []
+    pts = [(wp.transform.location.x, wp.transform.location.y)]
+    acc, guard = 0.0, 0
+    max_pts = int(dist_m / max(step_m, 0.1)) + 10  # 무한루프 방지 상한
+    while acc < dist_m and guard < max_pts:
+        guard += 1
+        nxts = wp.next(step_m)
+        if not nxts:
+            break
+        if len(nxts) == 1:
+            nxt = nxts[0]
+        else:
+            # 여러 갈래: 현 waypoint 진행방향과 yaw 차가 가장 작은 분기 선택(직진)
+            base_yaw = math.radians(wp.transform.rotation.yaw)
+            base = (math.cos(base_yaw), math.sin(base_yaw))
+            nxt = max(nxts, key=lambda w: (
+                math.cos(math.radians(w.transform.rotation.yaw)) * base[0]
+                + math.sin(math.radians(w.transform.rotation.yaw)) * base[1]))
+        wp = nxt
+        pts.append((wp.transform.location.x, wp.transform.location.y))
+        acc += step_m
+    return pts
 
 
 class CameraView:
@@ -221,11 +307,15 @@ def main():
     control_rx = None
     follower = None
     alpamayo_drive = False
-    last_logged_seq = None       # 새 plan 로깅용
-    last_plan_log_t = 0.0        # 직전 plan 로그 시각(간격 측정)
+    map_route_drive = False
     if args.alpamayo_control:
         control_rx = AlpamayoControlReceiver(host=args.alpamayo_control_host,
                                              port=args.alpamayo_control_port)
+
+    # --- 디버그 맵 viz (옵션) ---
+    viz = None
+    if args.viz:
+        viz = VizServer(host=args.viz_host, port=args.viz_port)
 
     actors = []
     side_cams = {}
@@ -246,21 +336,40 @@ def main():
         vehicle.set_autopilot(autopilot)
         print("자동주행 켜짐" if autopilot else "수동운전 모드 (WASD)")
 
-        # 제어기: 차량 물리에서 휠베이스/최대조향각 추출
-        if control_rx is not None:
-            try:
-                pc = vehicle.get_physics_control()
-                wheels = pc.wheels
-                max_steer = max(w.max_steer_angle for w in wheels) or 70.0
-                # 앞/뒤 축 위치차로 휠베이스 추정 (cm -> m)
-                xs = [w.position.x for w in wheels]
-                wheelbase = abs(max(xs) - min(xs)) / 100.0 or 2.875
-            except Exception:
-                max_steer, wheelbase = 70.0, 2.875
-            follower = PathFollower(wheelbase_m=wheelbase, max_steer_deg=max_steer)
-            control_rx.start()
-            print(f"[alpamayo] 제어 준비 (wheelbase={wheelbase:.2f}m, "
-                  f"max_steer={max_steer:.1f}deg). 키 O 로 Alpamayo 주행 토글")
+        # 차량 물리에서 휠베이스/최대조향각 1회 추출 (viz·제어 공통 기준점).
+        # 후륜축 = center - L/2·forward. viz·제어·경로고정 모두 같은 L 사용.
+        wheelbase_m, max_steer_deg = 2.875, 70.0
+        try:
+            wheels = vehicle.get_physics_control().wheels
+            # 앞/뒤축 위치차(월드 cm)로 휠베이스 추정 (orientation 무관)
+            fr, re = wheels[0].position, wheels[2].position
+            wheelbase_m = math.hypot(fr.x - re.x, fr.y - re.y) / 100.0 or 2.875
+            max_steer_deg = max(w.max_steer_angle for w in wheels) or 70.0
+        except Exception:
+            pass
+
+        # 맵 viz: 후륜축 기준점으로 그린다.
+        if viz is not None:
+            viz.start()
+            print(f"[viz] 기준점=후륜축 (wheelbase={wheelbase_m:.2f}m)")
+            rx, ry, yaw0 = rear_axle_xy(vehicle.get_transform(), wheelbase_m)
+            viz.update(rx, ry, yaw0, 0.0)
+
+        # 제어기: closed-loop world-frame pure pursuit (실제 차 pose 로 추종)
+        # Alpamayo(--alpamayo-control)와 맵 route(--map-route)가 같은 follower를
+        # 재사용한다. 한 번에 한 소스만 활성(O=Alpamayo, G=맵route).
+        carla_map = world.get_map()
+        if control_rx is not None or args.map_route:
+            follower = WorldPathFollower(wheelbase_m=wheelbase_m,
+                                         max_steer_deg=max_steer_deg)
+            if control_rx is not None:
+                control_rx.start()
+                print(f"[alpamayo] 제어 준비 (closed-loop pure pursuit, "
+                      f"wheelbase={wheelbase_m:.2f}m, max_steer={max_steer_deg:.1f}deg). "
+                      f"키 O 로 Alpamayo 주행 토글")
+            if args.map_route:
+                print(f"[map-route] 맵 차선 추종 준비 (dist={args.map_route_dist:.0f}m, "
+                      f"step={args.map_route_step:.1f}m). 키 G 로 주행 토글")
 
         # --- 카메라 부착 (tele는 좁은 화각) ---
         # Alpamayo 모델 카메라는 계약 해상도(576x320)로 네이티브 렌더 → 리사이즈 불필요.
@@ -343,6 +452,7 @@ def main():
         active_id = main_id
         steer = 0.0  # 현재 조향각(부드러운 전환용)
         next_alpamayo_tick = time.monotonic()  # 10Hz 샘플 적재 시점
+        last_viz_plan_id = None  # viz 고정 경로 갱신용(새 plan 감지)
 
         def evt_win_id(event):
             ew = getattr(event, "window", None)
@@ -362,8 +472,9 @@ def main():
                         running = False
                     elif event.key == pygame.K_p:
                         autopilot = not autopilot
-                        if autopilot and alpamayo_drive:
+                        if autopilot:
                             alpamayo_drive = False  # 모드 충돌 방지
+                            map_route_drive = False
                         vehicle.set_autopilot(autopilot)
                         print("자동주행" if autopilot else "수동운전(WASD)")
                     elif event.key == pygame.K_o and control_rx is not None:
@@ -371,8 +482,26 @@ def main():
                         if alpamayo_drive:
                             autopilot = False
                             vehicle.set_autopilot(False)
+                            map_route_drive = False  # 모드 충돌 방지
                         print("Alpamayo 주행 ON" if alpamayo_drive
                               else "Alpamayo 주행 OFF (수동)")
+                    elif event.key == pygame.K_g and follower is not None \
+                            and args.map_route:
+                        map_route_drive = not map_route_drive
+                        if map_route_drive:
+                            autopilot = False
+                            vehicle.set_autopilot(False)
+                            alpamayo_drive = False  # 모드 충돌 방지
+                            # 지금 pose 기준으로 앞 차선 route 새로 생성 후 고정
+                            pts = lane_route_ahead(
+                                carla_map, vehicle.get_transform(),
+                                args.map_route_dist, args.map_route_step)
+                            follower.set_path(pts)
+                            if viz is not None:
+                                viz.set_fixed_path(pts)
+                            print(f"[map-route] 주행 ON — 차선 route {len(pts)}점 고정")
+                        else:
+                            print("[map-route] 주행 OFF (수동)")
                     elif has_sides and event.key == pygame.K_LEFT:
                         side_yaw = max(0.0, side_yaw - 2.0); apply_sides()
                     elif has_sides and event.key == pygame.K_RIGHT:
@@ -407,39 +536,46 @@ def main():
                         side_pitch = pitch_slider.x_to_value(event.pos[0])
                         apply_sides()
 
-            alpa_hud = None  # HUD 표시용 (steer/throttle/brake/age)
-            # --- Alpamayo 주행: UDP 경로 추종 ---
-            if alpamayo_drive and follower is not None:
+            alpa_hud = None  # HUD 표시용 (steer/throttle/brake/cte)
+            # --- 새 경로 수신 감지: 받은 순간 차 pose 로 world 에 고정 ---
+            # (follower·viz 공통. 이후 follower 는 실제 차 pose 로 이 경로를 추종)
+            if control_rx is not None and not map_route_drive:
+                newplan, _age = control_rx.latest()
+                if newplan is not None and id(newplan) != last_viz_plan_id:
+                    last_viz_plan_id = id(newplan)
+                    wpts = ego_path_to_world(vehicle.get_transform(),
+                                             wheelbase_m, newplan["points"])
+                    follower.set_path(wpts)
+                    if viz is not None:
+                        viz.set_fixed_path(wpts)
+                    seq = newplan.get("seq")
+                    now = time.time()
+                    ts = time.strftime("%H:%M:%S") + f".{int((now % 1) * 1000):03d}"
+                    print(f"[{ts}] 새 경로 seq={seq} 고정 ({follower.n_points}점, "
+                          f"{'주행중' if alpamayo_drive else '대기(O로 시작)'})", flush=True)
+
+            # --- 자율주행: 고정 world 경로 closed-loop 추종 ---
+            # (Alpamayo=O 또는 맵 route=G, 둘 다 같은 WorldPathFollower 사용)
+            if (alpamayo_drive or map_route_drive) and follower is not None:
                 vel = vehicle.get_velocity()
                 speed_mps = math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z)
-                plan, age = control_rx.latest()
+                tr = vehicle.get_transform()
+                rax, ray, ryaw = rear_axle_xy(tr, wheelbase_m)
                 control = carla.VehicleControl()
-                if plan is None or age > STALE_PLAN_S:
-                    # plan 없음/오래됨 -> 감속 정지
+                if not follower.has_path:
                     control.throttle, control.brake, control.steer = 0.0, 0.3, 0.0
-                    alpa_hud = f"Alpamayo 대기/stale (age={age:.2f}s)"
+                    alpa_hud = "Alpamayo 경로 대기"
                 else:
-                    st, th, br = follower.compute(plan, speed_mps, age)
-                    control.steer, control.throttle, control.brake = st, th, br
-                    alpa_hud = (f"Alpamayo steer={st:+.2f} thr={th:.2f} brk={br:.2f} "
-                                f"age={age:.2f}s pkt={control_rx.stats()['packets']}")
-                    # 새 plan(seq)이 들어왔을 때만 시간/지연/제어값 한 줄 기록
-                    seq = plan.get("seq")
-                    if seq != last_logged_seq:
-                        now = time.time()
-                        ts = time.strftime("%H:%M:%S") + f".{int((now % 1) * 1000):03d}"
-                        t0_us = plan.get("t0_us") or 0
-                        e2e_ms = (now * 1e6 - t0_us) / 1000.0 if t0_us else float("nan")
-                        infer_ms = (plan.get("inference_time_s") or 0.0) * 1000.0
-                        gap_ms = (now - last_plan_log_t) * 1000.0 if last_plan_log_t else 0.0
-                        print(f"[{ts}] plan seq={seq} e2e={e2e_ms:6.0f}ms "
-                              f"infer={infer_ms:5.0f}ms gap={gap_ms:6.0f}ms "
-                              f"s={follower.last_slice_s:4.1f}m gi={follower.last_i_goal:2d} "
-                              f"steer={st:+.2f} thr={th:.2f} "
-                              f"brk={br:.2f} v={speed_mps * 3.6:4.1f}km/h",
-                              flush=True)
-                        last_logged_seq = seq
-                        last_plan_log_t = now
+                    st, th, br = follower.compute(rax, ray, ryaw, speed_mps)
+                    if follower.finished:
+                        control.throttle, control.brake, control.steer = 0.0, 0.5, 0.0
+                        alpa_hud = (f"경로 끝 도달 정지 "
+                                    f"(i={follower.last_i_goal}/{follower.n_points})")
+                    else:
+                        control.steer, control.throttle, control.brake = st, th, br
+                        alpa_hud = (f"PP steer={st:+.2f} thr={th:.2f} brk={br:.2f} "
+                                    f"cte={follower.last_cte:.2f}m ld={follower.last_ld:.1f}m "
+                                    f"gi={follower.last_i_goal}/{follower.n_points}")
                 vehicle.apply_control(control)
             # --- 수동운전: 눌린 키로 차량 제어 ---
             elif not autopilot:
@@ -469,6 +605,14 @@ def main():
                         (right.x, right.y, right.z),
                         math.radians(tr.rotation.yaw))
                 bridge.tick(pose)
+
+            # --- 맵 viz 갱신 (스폰 원점 기준 후륜축 위치/궤적) ---
+            # 고정 경로(set_fixed_path)는 위 '새 경로 수신 감지' 블록에서 설정됨.
+            if viz is not None:
+                vv = vehicle.get_velocity()
+                spd = math.sqrt(vv.x * vv.x + vv.y * vv.y + vv.z * vv.z)
+                rx, ry, ryaw = rear_axle_xy(vehicle.get_transform(), wheelbase_m)
+                viz.update(rx, ry, ryaw, spd)
 
             # --- 카메라 격자 그리기 ---
             main_ren.draw_color = pygame.Color(20, 20, 20)
@@ -533,6 +677,8 @@ def main():
 
     finally:
         print("정리 중...")
+        if viz is not None:
+            viz.stop()
         if control_rx is not None:
             control_rx.stop()
         if bridge is not None:
