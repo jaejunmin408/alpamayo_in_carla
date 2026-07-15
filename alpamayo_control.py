@@ -39,6 +39,20 @@ SPEED_DEADBAND_MPS = 0.3
 TARGET_SPEED_KMH = 20.0
 
 
+def longitudinal_throttle_brake(v_target: float, speed_mps: float) -> tuple[float, float]:
+    """목표속도 v_target(m/s) - 현재속도 P 제어 → (throttle, brake).
+
+    횡방향 제어기(WorldPathFollower / LateralMPC)가 공유하는 종방향 로직.
+    """
+    err = v_target - speed_mps
+    throttle = brake = 0.0
+    if err > SPEED_DEADBAND_MPS:
+        throttle = min(1.0, KP_THROTTLE * err)
+    elif err < -SPEED_DEADBAND_MPS:
+        brake = min(1.0, KP_BRAKE * (-err))
+    return throttle, brake
+
+
 class AlpamayoControlReceiver:
     """UDP text_json 패킷을 받아 최신 plan 을 보관."""
 
@@ -270,10 +284,5 @@ class WorldPathFollower:
             v_target = TARGET_SPEED_KMH / 3.6
             self.last_v_source = "fixed"
         self.last_v_target = v_target
-        err = v_target - speed_mps
-        throttle = brake = 0.0
-        if err > SPEED_DEADBAND_MPS:
-            throttle = min(1.0, KP_THROTTLE * err)
-        elif err < -SPEED_DEADBAND_MPS:
-            brake = min(1.0, KP_BRAKE * (-err))
+        throttle, brake = longitudinal_throttle_brake(v_target, speed_mps)
         return round(steer_cmd, 4), round(throttle, 4), round(brake, 4)

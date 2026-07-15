@@ -43,6 +43,7 @@ from pygame._sdl2.video import Window, Renderer, Texture
 
 from alpamayo_bridge import AlpamayoBridge, REQUIRED_CAMERAS, IMAGE_W, IMAGE_H
 from alpamayo_control import AlpamayoControlReceiver, WorldPathFollower
+from mpc_control import LateralMPC
 from viz_server import VizServer
 
 
@@ -408,23 +409,36 @@ def main():
             rx, ry, yaw0 = rear_axle_xy(vehicle.get_transform(), wheelbase_m)
             viz.update(rx, ry, yaw0, 0.0)
 
-        # 제어기: closed-loop world-frame pure pursuit (실제 차 pose 로 추종)
-        # Alpamayo(--alpamayo-control)와 맵 route(--map-route)가 같은 follower를
-        # 재사용한다. 한 번에 한 소스만 활성(O=Alpamayo, G=맵route).
+        # 제어기: closed-loop world-frame 횡방향 추종 (실제 차 pose 기준).
+        # 두 횡방향 제어기를 준비해 키 M 으로 토글한다:
+        #   pp_follower  : pure pursuit (기본)
+        #   mpc_follower : LTV-MPC
+        # 종방향(모델 속도 P)은 두 제어기가 공유. Alpamayo(--alpamayo-control)와
+        # 맵 route(--map-route)가 같은 제어기를 재사용(한 번에 한 소스만 활성).
         carla_map = world.get_map()
+        pp_follower = mpc_follower = follower = None
+        use_mpc = False
         if control_rx is not None or args.map_route:
-            follower = WorldPathFollower(wheelbase_m=wheelbase_m,
-                                         max_steer_deg=max_steer_deg)
+            pp_follower = WorldPathFollower(wheelbase_m=wheelbase_m,
+                                            max_steer_deg=max_steer_deg)
+            mpc_follower = LateralMPC(wheelbase_m=wheelbase_m,
+                                      max_steer_deg=max_steer_deg)
+            follower = pp_follower
             if control_rx is not None:
                 control_rx.start()
-                print(f"[alpamayo] 제어 준비 (closed-loop pure pursuit, "
+                print(f"[alpamayo] 제어 준비 (횡방향 pure pursuit/MPC, "
                       f"wheelbase={wheelbase_m:.2f}m, max_steer={max_steer_deg:.1f}deg). "
-                      f"키 O 로 Alpamayo 주행 토글, 키 T 로 경로 앵커(현재/t0) 토글, "
-                      f"키 V 로 종방향 목표속도(모델/고정) 토글, "
-                      f"키 L 로 lookahead(% 인덱스/거리) 토글")
+                      f"키 O 주행, T 앵커(현재/t0), V 종방향속도(모델/고정), "
+                      f"L lookahead(%/거리), M 횡방향(PP/MPC), [ ] MPC 조향 slew 조정")
             if args.map_route:
                 print(f"[map-route] 맵 차선 추종 준비 (dist={args.map_route_dist:.0f}m, "
                       f"step={args.map_route_step:.1f}m). 키 G 로 주행 토글")
+
+        def set_follower_path(points, velocities=None):
+            """pp/mpc 두 제어기에 동일 경로를 설정(활성 토글 시 즉시 사용 가능)."""
+            if pp_follower is not None:
+                pp_follower.set_path(points, velocities)
+                mpc_follower.set_path(points, velocities)
 
         # --- 카메라 부착 (tele는 좁은 화각) ---
         # Alpamayo 모델 카메라는 계약 해상도(576x320)로 네이티브 렌더 → 리사이즈 불필요.
@@ -547,13 +561,27 @@ def main():
                         print(f"[anchor] 경로 앵커 = "
                               f"{'t0 pose(추론 입력 시점)' if anchor_t0 else '현재 pose'}")
                     elif event.key == pygame.K_v and follower is not None:
-                        follower.use_model_speed = not follower.use_model_speed
+                        # 종방향은 두 제어기 공유 → 둘 다 반영
+                        ums = not follower.use_model_speed
+                        pp_follower.use_model_speed = ums
+                        mpc_follower.use_model_speed = ums
                         print(f"[속도] 종방향 목표 = "
-                              f"{'모델 pred_v_mps' if follower.use_model_speed else '고정 목표속도'}")
-                    elif event.key == pygame.K_l and follower is not None:
-                        follower.use_index_lookahead = not follower.use_index_lookahead
-                        print(f"[lookahead] 목표점 선택 = "
-                              f"{'남은경로 %s%% 인덱스' % int(follower.pp_index_pct * 100) if follower.use_index_lookahead else '속도기반 거리(Ld)'}")
+                              f"{'모델 pred_v_mps' if ums else '고정 목표속도'}")
+                    elif event.key == pygame.K_l and pp_follower is not None:
+                        # lookahead 방식은 pure pursuit 전용 설정
+                        pp_follower.use_index_lookahead = not pp_follower.use_index_lookahead
+                        print(f"[lookahead] (PP) 목표점 선택 = "
+                              f"{'남은경로 %s%% 인덱스' % int(pp_follower.pp_index_pct * 100) if pp_follower.use_index_lookahead else '속도기반 거리(Ld)'}")
+                    elif event.key == pygame.K_m and mpc_follower is not None:
+                        use_mpc = not use_mpc
+                        follower = mpc_follower if use_mpc else pp_follower
+                        print(f"[횡방향] 제어기 = {'LTV-MPC' if use_mpc else 'pure pursuit'}")
+                    elif event.key == pygame.K_LEFTBRACKET and mpc_follower is not None:
+                        mpc_follower.max_dsteer = max(0.005, mpc_follower.max_dsteer - 0.005)
+                        print(f"[MPC] 조향 slew 제한 = {mpc_follower.max_dsteer:.3f}/frame (더 부드럽게)")
+                    elif event.key == pygame.K_RIGHTBRACKET and mpc_follower is not None:
+                        mpc_follower.max_dsteer = min(0.5, mpc_follower.max_dsteer + 0.005)
+                        print(f"[MPC] 조향 slew 제한 = {mpc_follower.max_dsteer:.3f}/frame (더 반응성)")
                     elif event.key == pygame.K_g and follower is not None \
                             and args.map_route:
                         map_route_drive = not map_route_drive
@@ -565,7 +593,7 @@ def main():
                             pts = lane_route_ahead(
                                 carla_map, vehicle.get_transform(),
                                 args.map_route_dist, args.map_route_step)
-                            follower.set_path(pts)
+                            set_follower_path(pts)
                             if viz is not None:
                                 viz.set_fixed_path(pts)
                             print(f"[map-route] 주행 ON — 차선 route {len(pts)}점 고정")
@@ -629,7 +657,7 @@ def main():
                                                  wheelbase_m, newplan["points"])
                         if anchor_t0:
                             anchor_src = "현재(t0 조회실패)"
-                    follower.set_path(wpts, newplan.get("v_mps"))
+                    set_follower_path(wpts, newplan.get("v_mps"))
                     if viz is not None:
                         viz.set_fixed_path(wpts)
                     seq = newplan.get("seq")
@@ -658,7 +686,8 @@ def main():
                                     f"(i={follower.last_i_goal}/{follower.n_points})")
                     else:
                         control.steer, control.throttle, control.brake = st, th, br
-                        alpa_hud = (f"PP steer={st:+.2f} thr={th:.2f} brk={br:.2f} "
+                        alpa_hud = (f"{'MPC' if use_mpc else 'PP'} "
+                                    f"steer={st:+.2f} thr={th:.2f} brk={br:.2f} "
                                     f"cte={follower.last_cte:.2f}m "
                                     f"ld={follower.last_ld:.1f}m[{follower.last_lookahead_mode}] "
                                     f"v*={follower.last_v_target * 3.6:.0f}kph({follower.last_v_source}) "
