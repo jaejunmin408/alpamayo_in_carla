@@ -81,6 +81,7 @@ pygame 카메라 창에 포커스를 둔 상태에서:
 | **O** | **Alpamayo 주행 토글.** 모델이 UDP로 준 경로를 pure pursuit로 추종 시작/중지 (`--alpamayo-control` 필요) |
 | **T** | **경로 앵커 토글: 현재 pose ↔ t0 pose.** 받은 경로를 "지금" 위치가 아니라 **추론 입력 프레임(t0) 시점** 위치에 붙임 (아래 설명) |
 | **V** | **종방향 목표속도 토글: 모델 속도 ↔ 고정 속도.** 모델 `pred_v_mps` 를 목표로 쓸지, 고정 `TARGET_SPEED_KMH` 로 쓸지 |
+| **L** | **lookahead 방식 토글: 남은 경로 % 인덱스 ↔ 속도기반 거리.** 목표점을 남은 경로의 몇 % 지점으로 고를지(기본), 속도비례 거리 `Ld`로 고를지 |
 | **G** | **맵 차선 route 주행 토글.** 누른 순간 앞 차선 경로를 생성해 고정 추종 (`--map-route` 필요, 모델 불필요) |
 | **P** | CARLA 내장 autopilot 토글 |
 | **← →** | 사이드 카메라 yaw(좌우 각도) 조절 (사이드캠 있을 때) |
@@ -105,23 +106,34 @@ HUD 예시: `PP steer=+0.12 thr=0.30 brk=0.00 cte=0.45m ld=6.3m v*=20kph(model) 
 
 후륜축(rear axle) 기준 world frame에서, 내 차 위치를 정확히 아는 상태로 경로를 위치 기반으로 따라갑니다:
 
-1. 후륜축에서 경로상 **가장 가까운 점**(앞으로만 탐색) 찾기
-2. 거기서 **lookahead 거리 `Ld` 이상 앞의 점**을 목표점으로 선택
+1. 후륜축에서 경로상 **가장 가까운 점**(`ci`, 앞으로만 탐색) 찾기
+2. **목표점(goal) 선택** — 아래 두 방식 중 하나 (키 `L` 로 토글)
 3. 목표점을 차체좌표로 변환 → `α` → `δ = atan2(2·L·sinα, dist)` → steer
 
 dead-reckoning open-loop 가 아니라 매 프레임 실제 후륜축 (x, y, yaw)로 목표점을 다시 찾기 때문에
 cross-track / heading 오차를 그대로 보정합니다.
 
-**lookahead 거리 설정** (`WorldPathFollower.__init__`):
+**목표점 선택 방식** (`WorldPathFollower`, 키 `L` 로 전환):
 
-```
-Ld = clamp(ld_gain · v + ld_l0,  ld_min,  ld_max)
-   = clamp(0.6 · v + 3.0,        4.0,     10.0)   [m]
-```
+- **① 남은 경로 % 인덱스 (기본, `use_index_lookahead=True`)**
+  ```
+  gi = ci + round(pp_index_pct · (n-1 - ci))     # n = 경로 점 개수
+     = ci + round(0.5 · (n-1 - ci))              # 기본 pct = 0.5
+  ```
+  - 현재 최근접점(`ci`)부터 **경로 끝까지 중 `pp_index_pct` 지점**을 목표로 → 속도와 무관
+  - 차가 진행할수록 목표가 항상 앞에 있고, 경로 끝에서 자연히 수렴
+  - 최소 1점 앞(`ci+1`)·상한 `n-1`로 clamp → `pct=0/1` 이어도 안전
+  - 목표 비율은 `pp_index_pct`(기본 0.5)로 조정
 
-- 속도(v)에 비례해 커지되 하한 4m / 상한 10m로 clamp
-- 예) 정지 시 4m, 20km/h(≈5.6m/s)에서 ≈ 6.3m
-- 값은 생성자 인자(`ld_gain`, `ld_l0`, `ld_min`, `ld_max`)로 조정
+- **② 속도기반 거리 (fallback, `use_index_lookahead=False`)**
+  ```
+  Ld = clamp(ld_gain · v + ld_l0,  ld_min,  ld_max)
+     = clamp(0.6 · v + 3.0,        4.0,     10.0)   [m]
+  ```
+  - 최근접점부터 `Ld` 이상 떨어진 첫 점을 목표로. 속도에 비례(하한 4m/상한 10m)
+  - 예) 정지 시 4m, 20km/h(≈5.6m/s)에서 ≈ 6.3m
+
+> HUD의 `ld=…m[pct|dist]` 는 실제 목표점까지의 유효 lookahead 거리와 현재 방식을 표시합니다.
 
 ### 종방향 (throttle / brake) — 모델 속도 목표 P 제어
 

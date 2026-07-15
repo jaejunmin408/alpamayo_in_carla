@@ -420,7 +420,8 @@ def main():
                 print(f"[alpamayo] 제어 준비 (closed-loop pure pursuit, "
                       f"wheelbase={wheelbase_m:.2f}m, max_steer={max_steer_deg:.1f}deg). "
                       f"키 O 로 Alpamayo 주행 토글, 키 T 로 경로 앵커(현재/t0) 토글, "
-                      f"키 V 로 종방향 목표속도(모델/고정) 토글")
+                      f"키 V 로 종방향 목표속도(모델/고정) 토글, "
+                      f"키 L 로 lookahead(% 인덱스/거리) 토글")
             if args.map_route:
                 print(f"[map-route] 맵 차선 추종 준비 (dist={args.map_route_dist:.0f}m, "
                       f"step={args.map_route_step:.1f}m). 키 G 로 주행 토글")
@@ -549,6 +550,10 @@ def main():
                         follower.use_model_speed = not follower.use_model_speed
                         print(f"[속도] 종방향 목표 = "
                               f"{'모델 pred_v_mps' if follower.use_model_speed else '고정 목표속도'}")
+                    elif event.key == pygame.K_l and follower is not None:
+                        follower.use_index_lookahead = not follower.use_index_lookahead
+                        print(f"[lookahead] 목표점 선택 = "
+                              f"{'남은경로 %s%% 인덱스' % int(follower.pp_index_pct * 100) if follower.use_index_lookahead else '속도기반 거리(Ld)'}")
                     elif event.key == pygame.K_g and follower is not None \
                             and args.map_route:
                         map_route_drive = not map_route_drive
@@ -654,7 +659,8 @@ def main():
                     else:
                         control.steer, control.throttle, control.brake = st, th, br
                         alpa_hud = (f"PP steer={st:+.2f} thr={th:.2f} brk={br:.2f} "
-                                    f"cte={follower.last_cte:.2f}m ld={follower.last_ld:.1f}m "
+                                    f"cte={follower.last_cte:.2f}m "
+                                    f"ld={follower.last_ld:.1f}m[{follower.last_lookahead_mode}] "
                                     f"v*={follower.last_v_target * 3.6:.0f}kph({follower.last_v_source}) "
                                     f"gi={follower.last_i_goal}/{follower.n_points}")
                 vehicle.apply_control(control)

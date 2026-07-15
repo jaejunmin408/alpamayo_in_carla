@@ -132,8 +132,9 @@ class WorldPathFollower:
     실제 후륜축 (x,y,yaw) 로 경로에서 목표점을 찾으므로 cross-track/heading
     오차를 그대로 보정한다:
 
-      1) 후륜축에서 경로상 '가장 가까운 점'(앞으로만 탐색)을 찾고
-      2) 거기서부터 lookahead 거리 Ld=clamp(k*v+L0, min, max) 이상 앞의 점을 목표로
+      1) 후륜축에서 경로상 '가장 가까운 점'(ci, 앞으로만 탐색)을 찾고
+      2) 남은 경로(ci..end) 인덱스의 pp_index_pct 지점을 목표점으로 (기본).
+         use_index_lookahead=False 면 속도기반 거리 Ld=clamp(k*v+L0,min,max) 사용.
       3) 목표점을 차체좌표로 변환 -> α -> δ=atan2(2L·sinα, dist) -> steer
 
     부호규약: local_y = +y_world 성분(=CARLA 우측),
@@ -145,9 +146,15 @@ class WorldPathFollower:
 
     def __init__(self, wheelbase_m=DEFAULT_WHEELBASE_M,
                  max_steer_deg=DEFAULT_MAX_STEER_DEG,
+                 pp_index_pct=0.5,
                  ld_gain=0.6, ld_l0=3.0, ld_min=4.0, ld_max=10.0, reach_r=2.0):
         self.wheelbase = float(wheelbase_m)
         self.max_steer_rad = math.radians(float(max_steer_deg))
+        # lookahead 목표점 선택 방식:
+        #   True  : 남은 경로(ci..end) 인덱스의 pp_index_pct 지점을 목표로 (속도 무관)
+        #   False : 속도기반 거리 lookahead Ld=clamp(k*v+L0, min, max) (기존 방식)
+        self.use_index_lookahead = True
+        self.pp_index_pct = float(pp_index_pct)   # 남은 경로 중 목표 인덱스 비율 0~1
         self.ld_gain = ld_gain
         self.ld_l0 = ld_l0
         self.ld_min = ld_min
@@ -160,7 +167,8 @@ class WorldPathFollower:
         # HUD/로깅
         self.last_i_goal = 0
         self.last_cte = 0.0        # 경로까지 최단거리(cross-track 크기)
-        self.last_ld = 0.0
+        self.last_ld = 0.0         # 최근 유효 lookahead 거리(목표점까지, m)
+        self.last_lookahead_mode = "pct"  # "pct" | "dist"
         self.last_v_target = 0.0   # 최근 종방향 목표속도(m/s)
         self.last_v_source = "fixed"  # "model" | "fixed"
         self.finished = False
@@ -217,17 +225,25 @@ class WorldPathFollower:
                 or ci >= len(self._path) - 1):
             self.finished = True
 
-        # lookahead 거리 Ld = clamp(k*v + L0, min, max)
-        ld = min(self.ld_max, max(self.ld_min, self.ld_gain * speed_mps + self.ld_l0))
-        self.last_ld = ld
-
-        # 최근접점부터 Ld 이상 떨어진 첫 점을 목표로(앞으로만). 없으면 마지막 점.
-        gi = len(self._path) - 1
-        for i in range(ci, len(self._path)):
-            px, py = self._path[i]
-            if math.hypot(px - rear_x, py - rear_y) >= ld:
-                gi = i
-                break
+        # 목표점(goal) 선택.
+        #   pct 모드: 남은 경로(ci..end) 인덱스의 pp_index_pct 지점.
+        #            gi = ci + round(pct*(n-1-ci)) → 속도 무관, 끝에서 자연 수렴.
+        #   dist 모드(fallback): 최근접점부터 Ld=clamp(k*v+L0,min,max) 이상 앞의 점.
+        n = len(self._path)
+        if self.use_index_lookahead:
+            gi = ci + int(round(self.pp_index_pct * (n - 1 - ci)))
+            gi = max(min(ci + 1, n - 1), min(gi, n - 1))  # 최소 1점 앞, 상한 n-1
+            self.last_lookahead_mode = "pct"
+        else:
+            ld = min(self.ld_max, max(self.ld_min,
+                                      self.ld_gain * speed_mps + self.ld_l0))
+            gi = n - 1
+            for i in range(ci, n):
+                px, py = self._path[i]
+                if math.hypot(px - rear_x, py - rear_y) >= ld:
+                    gi = i
+                    break
+            self.last_lookahead_mode = "dist"
         self.last_i_goal = gi
         tx, ty = self._path[gi]
 
@@ -237,6 +253,7 @@ class WorldPathFollower:
         local_x = math.cos(yaw) * dx + math.sin(yaw) * dy    # 전방(+)
         local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy   # +y_world(=CARLA 우측)
         dist = math.hypot(dx, dy)
+        self.last_ld = dist                                  # 유효 lookahead(목표점까지)
         if dist < 1e-3:
             steer_cmd = 0.0
         else:
