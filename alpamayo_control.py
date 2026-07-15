@@ -130,13 +130,13 @@ class WorldPathFollower:
     후륜축 기준 world frame 에서 내 차 위치를 정확히 아는 상태로, 들어온 경로를
     위치 기반으로 따라간다. dead-reckoning open-loop 가 아니라, 매 프레임 차의
     실제 후륜축 (x,y,yaw) 로 경로에서 목표점을 찾으므로 cross-track/heading
-    오차를 그대로 보정한다 (follow_waypoints.PurePursuitLateral 과 동일 방식):
+    오차를 그대로 보정한다:
 
       1) 후륜축에서 경로상 '가장 가까운 점'(앞으로만 탐색)을 찾고
       2) 거기서부터 lookahead 거리 Ld=clamp(k*v+L0, min, max) 이상 앞의 점을 목표로
       3) 목표점을 차체좌표로 변환 -> α -> δ=atan2(2L·sinα, dist) -> steer
 
-    부호규약: follow_waypoints 와 동일. local_y = +y_world 성분(=CARLA 우측),
+    부호규약: local_y = +y_world 성분(=CARLA 우측),
     α>0 -> δ>0 -> steer>0 = CARLA 우회전.
     종방향: 모델 속도(pred_v_mps) 목표 P 제어. set_path 에 velocities 를 주면
     현재 위치의 점별 목표속도를 추종하고, 없으면 고정 목표속도(TARGET_SPEED_KMH).
@@ -231,7 +231,7 @@ class WorldPathFollower:
         self.last_i_goal = gi
         tx, ty = self._path[gi]
 
-        # 목표점을 차체좌표로 (follow_waypoints 와 동일 부호규약)
+        # 목표점을 차체좌표로 변환 (local_y=+y_world=CARLA 우측)
         yaw = math.radians(yaw_deg)
         dx, dy = tx - rear_x, ty - rear_y
         local_x = math.cos(yaw) * dx + math.sin(yaw) * dy    # 전방(+)

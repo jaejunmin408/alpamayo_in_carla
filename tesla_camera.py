@@ -132,8 +132,8 @@ def grid_shape(n):
 def rear_axle_xy(transform, wheelbase):
     """차량 transform(월드)에서 후륜축 위치(x, y[m])와 yaw(deg)를 계산.
 
-    후륜축 = 차량중심 - (L/2)*전방벡터. pure pursuit 제어(follow_waypoints,
-    alpamayo_control)가 쓰는 기준점과 동일하게 맞춰 viz 도 후륜축을 그린다.
+    후륜축 = 차량중심 - (L/2)*전방벡터. pure pursuit 제어(alpamayo_control)가
+    쓰는 기준점과 동일하게 맞춰 viz 도 후륜축을 그린다.
     """
     yaw_deg = transform.rotation.yaw
     yaw = math.radians(yaw_deg)
