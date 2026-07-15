@@ -34,6 +34,7 @@ import math
 import sys
 import time
 import weakref
+from collections import deque
 
 import carla
 import numpy as np
@@ -142,15 +143,14 @@ def rear_axle_xy(transform, wheelbase):
     return x, y, yaw_deg
 
 
-def ego_path_to_world(transform, wheelbase, points):
-    """ego-local 경로(x전방, y좌측+)를 CARLA world 좌표로 변환.
+def ego_path_to_world_rax(rax, ray, yaw_deg, points):
+    """후륜축 world pose(rax, ray, yaw_deg)에 ego-local 경로(x전방, y좌측+)를 붙여
+    world 좌표로 변환.
 
-    앵커 = 후륜축(viz 차 마커와 동일 기준점), 회전 = 차 yaw.
       wx = rax + fx*cosφ + fy*sinφ
       wy = ray + fx*sinφ - fy*cosφ
     (ego +y=좌측이 φ=0 에서 world -y 로 가는 CARLA 좌수 좌표계 규약)
     """
-    rax, ray, yaw_deg = rear_axle_xy(transform, wheelbase)
     phi = math.radians(yaw_deg)
     c, s = math.cos(phi), math.sin(phi)
     out = []
@@ -158,6 +158,59 @@ def ego_path_to_world(transform, wheelbase, points):
         fx, fy = float(p[0]), float(p[1])
         out.append((rax + fx * c + fy * s, ray + fx * s - fy * c))
     return out
+
+
+def ego_path_to_world(transform, wheelbase, points):
+    """ego-local 경로를 '현재 차 transform' 의 후륜축에 붙여 world 좌표로 변환."""
+    rax, ray, yaw_deg = rear_axle_xy(transform, wheelbase)
+    return ego_path_to_world_rax(rax, ray, yaw_deg, points)
+
+
+def _wrap_deg(d):
+    """각도차를 (-180, 180] 로 wrap."""
+    return (d + 180.0) % 360.0 - 180.0
+
+
+class PoseHistory:
+    """월클럭(us) 타임스탬프별 후륜축 pose(rax, ray, yaw_deg) 이력 버퍼.
+
+    plan["t0_us"] 는 alpamayo_bridge 가 time.time() 으로 찍어 Thor 가 그대로
+    되돌려준 값이라 이 프로세스의 월클럭과 동일하다. 그래서 t0_us 시점의 ego
+    pose 를 이 버퍼에서 조회하면, 들어온 경로를 '추론 입력 프레임(t0) 시점의
+    내 차 위치' 에 정확히 앵커할 수 있다 (= inference time 전 위치).
+    """
+
+    def __init__(self, keep_s=3.0):
+        self._keep_us = int(keep_s * 1e6)
+        self._buf = deque()  # (t_us, rax, ray, yaw_deg) 시간 오름차순
+
+    def add(self, t_us, rax, ray, yaw_deg):
+        self._buf.append((int(t_us), rax, ray, yaw_deg))
+        cutoff = int(t_us) - self._keep_us
+        while self._buf and self._buf[0][0] < cutoff:
+            self._buf.popleft()
+
+    def lookup(self, t_us):
+        """t_us 시점 pose(rax, ray, yaw_deg) 를 선형보간으로 반환. 버퍼 범위를
+        벗어나면(너무 오래됐거나 미래) None."""
+        if t_us is None or not self._buf:
+            return None
+        t_us = int(t_us)
+        if t_us < self._buf[0][0] or t_us > self._buf[-1][0]:
+            return None
+        prev = self._buf[0]
+        for cur in self._buf:
+            if cur[0] >= t_us:
+                span = cur[0] - prev[0]
+                if span <= 0:
+                    return prev[1], prev[2], prev[3]
+                r = (t_us - prev[0]) / span
+                rax = prev[1] + r * (cur[1] - prev[1])
+                ray = prev[2] + r * (cur[2] - prev[2])
+                yaw = prev[3] + r * _wrap_deg(cur[3] - prev[3])
+                return rax, ray, yaw
+            prev = cur
+        return prev[1], prev[2], prev[3]
 
 
 def lane_route_ahead(carla_map, transform, dist_m=200.0, step_m=2.0):
@@ -366,7 +419,7 @@ def main():
                 control_rx.start()
                 print(f"[alpamayo] 제어 준비 (closed-loop pure pursuit, "
                       f"wheelbase={wheelbase_m:.2f}m, max_steer={max_steer_deg:.1f}deg). "
-                      f"키 O 로 Alpamayo 주행 토글")
+                      f"키 O 로 Alpamayo 주행 토글, 키 T 로 경로 앵커(현재/t0) 토글")
             if args.map_route:
                 print(f"[map-route] 맵 차선 추종 준비 (dist={args.map_route_dist:.0f}m, "
                       f"step={args.map_route_step:.1f}m). 키 G 로 주행 토글")
@@ -453,6 +506,8 @@ def main():
         steer = 0.0  # 현재 조향각(부드러운 전환용)
         next_alpamayo_tick = time.monotonic()  # 10Hz 샘플 적재 시점
         last_viz_plan_id = None  # viz 고정 경로 갱신용(새 plan 감지)
+        anchor_t0 = False        # True 면 경로를 t0(추론 입력 프레임) pose 에 앵커
+        pose_hist = PoseHistory(keep_s=3.0)  # t0 pose 조회용 월클럭 pose 이력
 
         def evt_win_id(event):
             ew = getattr(event, "window", None)
@@ -485,6 +540,10 @@ def main():
                             map_route_drive = False  # 모드 충돌 방지
                         print("Alpamayo 주행 ON" if alpamayo_drive
                               else "Alpamayo 주행 OFF (수동)")
+                    elif event.key == pygame.K_t and control_rx is not None:
+                        anchor_t0 = not anchor_t0
+                        print(f"[anchor] 경로 앵커 = "
+                              f"{'t0 pose(추론 입력 시점)' if anchor_t0 else '현재 pose'}")
                     elif event.key == pygame.K_g and follower is not None \
                             and args.map_route:
                         map_route_drive = not map_route_drive
@@ -537,14 +596,29 @@ def main():
                         apply_sides()
 
             alpa_hud = None  # HUD 표시용 (steer/throttle/brake/cte)
-            # --- 새 경로 수신 감지: 받은 순간 차 pose 로 world 에 고정 ---
-            # (follower·viz 공통. 이후 follower 는 실제 차 pose 로 이 경로를 추종)
+            # --- 새 경로 수신 감지: 받은 경로를 world 에 고정 ---
+            # 앵커 pose = 현재(기본) 또는 t0(추론 입력 프레임 시점, 키 T). follower 는
+            # 이후 실제 차 pose 로 이 world 경로를 closed-loop 추종한다.
             if control_rx is not None and not map_route_drive:
+                # t0 앵커 조회용으로 매 프레임 현재 후륜축 pose 를 월클럭으로 적재
+                nrax, nray, nyaw = rear_axle_xy(vehicle.get_transform(), wheelbase_m)
+                pose_hist.add(time.time() * 1e6, nrax, nray, nyaw)
+
                 newplan, _age = control_rx.latest()
                 if newplan is not None and id(newplan) != last_viz_plan_id:
                     last_viz_plan_id = id(newplan)
-                    wpts = ego_path_to_world(vehicle.get_transform(),
-                                             wheelbase_m, newplan["points"])
+                    anchor_src = "현재"
+                    anchored = (pose_hist.lookup(newplan.get("t0_us"))
+                                if anchor_t0 else None)
+                    if anchored is not None:
+                        wpts = ego_path_to_world_rax(anchored[0], anchored[1],
+                                                     anchored[2], newplan["points"])
+                        anchor_src = "t0"
+                    else:
+                        wpts = ego_path_to_world(vehicle.get_transform(),
+                                                 wheelbase_m, newplan["points"])
+                        if anchor_t0:
+                            anchor_src = "현재(t0 조회실패)"
                     follower.set_path(wpts)
                     if viz is not None:
                         viz.set_fixed_path(wpts)
@@ -552,6 +626,7 @@ def main():
                     now = time.time()
                     ts = time.strftime("%H:%M:%S") + f".{int((now % 1) * 1000):03d}"
                     print(f"[{ts}] 새 경로 seq={seq} 고정 ({follower.n_points}점, "
+                          f"앵커={anchor_src}, "
                           f"{'주행중' if alpamayo_drive else '대기(O로 시작)'})", flush=True)
 
             # --- 자율주행: 고정 world 경로 closed-loop 추종 ---
