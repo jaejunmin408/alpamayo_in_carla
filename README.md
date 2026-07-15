@@ -1,5 +1,8 @@
 # CARLA + Alpamayo 자율주행 구동 환경
 
+<img width="1288" height="742" alt="image" src="https://github.com/user-attachments/assets/3bcd5d2a-897a-4c1d-b2f4-cd064cdcb137" />
+<img width="1049" height="881" alt="image" src="https://github.com/user-attachments/assets/98d2ceed-f5b8-436e-aa8c-79f8b92d4b58" />
+
 NVIDIA **Alpamayo** 주행 모델을 **CARLA 0.9.16** 시뮬레이터 위에서 돌리기 위한 코드 모음입니다.
 
 CARLA에 테슬라 차량 + 카메라/센서를 스폰해 **Alpamayo 입력(멀티 카메라 + ego history)** 을 만들어 서빙하고,
